@@ -1,546 +1,1077 @@
-import sys
 import os
-
-# Add lib directory to Python path
-script_dir = os.path.dirname(os.path.abspath(__file__))
-lib_dir = os.path.join(script_dir, 'lib')
-if lib_dir not in sys.path:
-    sys.path.insert(0, lib_dir)
-
-import shutil
+import sys
 import json
-import re
-import subprocess # For Inkscape & GIMP
-import io # For in-memory PDF conversion of PNGs
+import logging
+import subprocess
+# from functools import partial # Removed as it was unused
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                               QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
+                               QMessageBox, QProgressDialog, QCheckBox, QSplitter, QSpinBox,
+                               QDialog, QLineEdit, QDialogButtonBox, QAbstractItemView,
+                               QSizePolicy)
+from PySide6.QtCore import (Qt, QStandardPaths, Signal, QUrl, QMimeData, QSize, # Added QSize for OrderableListItemWidget
+                              QEvent, QPoint, QRect) # Added QEvent, QPoint, QRect for potential future use or if implicitly needed by Qt
+from PySide6.QtGui import (QDropEvent, QDragEnterEvent, QPixmap, QImage, QResizeEvent, QAction, # QAction is used for menu/toolbar, keep for now
+                             QPainter, QPen, QColor, QFontMetrics, QMouseEvent, QGuiApplication) # Added for custom widgets and event handling
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox,
-    QDialog, QScrollArea, QSpinBox, QDialogButtonBox, QCheckBox,
-    QMenuBar, QGroupBox, QStackedWidget, QSizePolicy
-)
-from PySide6.QtGui import QPixmap, QImage, QAction
-from PySide6.QtCore import Qt, QSize
-from pypdf import PdfWriter, PdfReader
+import fitz  # PyMuPDF
+from pypdf import PdfWriter, PdfReader, errors as pypdf_errors
 
-# Attempt to import PyMuPDF (fitz)
-try:
-    import fitz  # PyMuPDF
-    PYMUPDF_AVAILABLE = True
-except ImportError:
-    PYMUPDF_AVAILABLE = False
-    print("PyMuPDF (fitz) not found. PDF previews and PNG-to-PDF conversion will be disabled. Please install with 'pip install PyMuPDF'")
-
-CONFIG_FILE = 'pdf_tool_config.json'
+# Configuration
+CONFIG_FILE = 'config.json'
 DEFAULT_ORDERING_KEYWORDS = {
-    "front": 1, "install": 2, "cad": 3, "model": 4, "checklist": 100
+    "drawing": 10,
+    "plan": 20,
+    "detail": 30,
+    "schedule": 40,
+    "specification": 50,
+    "report": 60,
+    "photo": 70,
+    "other": 100
 }
-PREVIEW_WIDTH = 100
-PREVIEW_HEIGHT = 140
+
+# Setup basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
-# --- Configuration Handling ---
 def load_config():
-    defaults = {
-        'source_pdf_dir': '', 'factory_paperwork_dir': '',
-        'ordering_keywords': DEFAULT_ORDERING_KEYWORDS.copy(),
-        'inkscape_path': '', 'gimp_path': ''
-    }
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                if 'project_dir' in config and 'factory_paperwork_dir' not in config:
-                    config['factory_paperwork_dir'] = config.pop('project_dir')
-                for key, value in defaults.items(): config.setdefault(key, value)
-                return config
-        except Exception as e: print(f"Error loading {CONFIG_FILE}: {e}. Using defaults.")
-    return defaults
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        logger.info(f"{CONFIG_FILE} not found. Using default configuration.")
+        return {} # Return empty dict to signify using defaults or a fresh setup
+    except json.JSONDecodeError:
+        # QMessageBox.warning(None, "Config Error", f"Error decoding {CONFIG_FILE}. Using default configuration.")
+        # Avoid UI elements in non-UI code; log instead or handle in UI part
+        logger.error(f"Error decoding {CONFIG_FILE}. Returning empty config.")
+        return {}
+    return config
 
 def save_config(config):
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f: json.dump(config, f, indent=4)
-    except Exception as e: QMessageBox.warning(None, "Config Error", f"Could not save config: {e}")
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4)
+    except IOError as e:
+        # QMessageBox.critical(None, "Config Error", f"Failed to save configuration to {CONFIG_FILE}: {e}")
+        logger.error(f"Failed to save configuration to {CONFIG_FILE}: {e}")
 
-# --- File Preview Generation ---
-def generate_file_preview(file_full_path):
-    filename_lower = file_full_path.lower()
-    if filename_lower.endswith(".pdf"):
-        if not PYMUPDF_AVAILABLE: return None
-        try:
-            doc = fitz.open(file_full_path)
-            if not doc.page_count > 0: doc.close(); return None
-            page = doc.load_page(0); zoom = 1.5; mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            fmt = QImage.Format.Format_RGB888 if pix.alpha == 0 else QImage.Format.Format_ARGB32
-            qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
-            qpix = QPixmap.fromImage(qimg); doc.close()
-            return qpix.scaled(QSize(PREVIEW_WIDTH, PREVIEW_HEIGHT), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        except Exception as e: print(f"Error PDF preview {os.path.basename(file_full_path)}: {e}"); return None
-    elif filename_lower.endswith(".png"):
-        try:
-            qpix = QPixmap(file_full_path)
-            if qpix.isNull(): return None
-            return qpix.scaled(QSize(PREVIEW_WIDTH, PREVIEW_HEIGHT), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        except Exception as e: print(f"Error PNG preview {os.path.basename(file_full_path)}: {e}"); return None
-    return None
 
-# --- Helper for Sorting ---
-def get_file_sort_priority(filename_short, ordering_keywords_config):
-    fn_lower = filename_short.lower()
-    num_match = re.search(r'\d+', filename_short)
-    num_val = int(num_match.group(0)) if num_match else float('inf')
-    num_presence = 0 if num_match else 1 # Sort items with numbers first
-    kw_val = float('inf') # Default for items without keywords
-    for kw, prio in ordering_keywords_config.items():
-        if kw.lower() in fn_lower: kw_val = min(kw_val, prio)
-    return (num_presence, num_val, kw_val, filename_short) # Sort key
+class OrderableListItemWidget(QWidget):
+    orderChanged = Signal()
 
-# --- Settings Dialog for Executable Paths ---
-class SettingsDialog(QDialog):
-    def __init__(self, current_inkscape_path, current_gimp_path, parent=None):
+    def __init__(self, filename, full_path, order, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Configure Executable Paths"); self.new_inkscape_path = current_inkscape_path; self.new_gimp_path = current_gimp_path
+        self.filename = filename
+        self.full_path = full_path
+        self._order = order
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 2, 5, 2) # Reduced margins
+
+        self.order_spinbox = QSpinBox()
+        self.order_spinbox.setMinimum(1)
+        self.order_spinbox.setMaximum(999)
+        self.order_spinbox.setValue(self._order)
+        self.order_spinbox.setFixedWidth(50)
+        self.order_spinbox.valueChanged.connect(self._emit_order_changed)
+        layout.addWidget(self.order_spinbox)
+
+        self.label = QLabel(self.filename)
+        self.label.setToolTip(self.full_path)
+        layout.addWidget(self.label, 1) # Give stretch to label
+
+    def get_order(self):
+        return self.order_spinbox.value()
+
+    def set_order(self, order):
+        self.order_spinbox.blockSignals(True)
+        self.order_spinbox.setValue(order)
+        self._order = order
+        self.order_spinbox.blockSignals(False)
+
+    def _emit_order_changed(self):
+        self._order = self.order_spinbox.value()
+        self.orderChanged.emit()
+
+    def sizeHint(self): # Ensure proper sizing in the list widget
+        return QSize(super().sizeHint().width(), self.order_spinbox.sizeHint().height() + 4) # Add a little padding
+
+class SettingsDialog(QDialog):
+    def __init__(self, current_inkscape_path, current_gimp_path, 
+                 current_delete_originals, current_ordering_keywords,
+                 current_libreoffice_draw_path, # New parameter
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(600)
+
+        self.new_inkscape_path = current_inkscape_path
+        self.new_gimp_path = current_gimp_path
+        self.new_delete_originals_on_action = current_delete_originals
+        # Ensure new_ordering_keywords is a dictionary, fallback to default if not
+        if not isinstance(current_ordering_keywords, dict):
+            logger.warning("Received non-dict ordering_keywords for SettingsDialog, falling back to default.")
+            self.new_ordering_keywords = DEFAULT_ORDERING_KEYWORDS.copy() # Use a copy
+        else:
+            self.new_ordering_keywords = current_ordering_keywords.copy() # Use a copy to avoid modifying original
+        self.new_libreoffice_draw_path = current_libreoffice_draw_path
+
         layout = QVBoxLayout(self)
-        for app_name, current_path_attr, edit_attr, browse_method_name, placeholder in [
-            ("Inkscape", "new_inkscape_path", "inkscape_path_edit", "_browse_inkscape_path", "e.g., .../inkscape.exe"),
-            ("GIMP", "new_gimp_path", "gimp_path_edit", "_browse_gimp_path", "e.g., .../gimp-2.10.exe")]:
-            group_box = QGroupBox(app_name); app_layout = QVBoxLayout(); path_layout = QHBoxLayout()
-            path_layout.addWidget(QLabel("Executable Path:"))
-            path_edit = QLineEdit(getattr(self, current_path_attr)); path_edit.setPlaceholderText(placeholder)
-            setattr(self, edit_attr, path_edit)
-            path_layout.addWidget(path_edit, 1)
-            browse_btn = QPushButton("Browse..."); browse_btn.clicked.connect(getattr(self, browse_method_name))
-            path_layout.addWidget(browse_btn); app_layout.addLayout(path_layout); group_box.setLayout(app_layout); layout.addWidget(group_box)
-        
-        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btn_box.accepted.connect(self._accept_settings); btn_box.rejected.connect(self.reject)
-        layout.addWidget(btn_box); self.setMinimumWidth(550)
 
-    def _browse_executable_path(self, line_edit_widget, title):
-        filt = "Executable files (*.exe)" if sys.platform == "win32" else "All files (*)"
-        curr_dir = os.path.dirname(line_edit_widget.text()) if line_edit_widget.text() else os.path.expanduser("~")
-        fp, _ = QFileDialog.getOpenFileName(self, title, curr_dir, filt)
-        if fp: line_edit_widget.setText(fp)
-    def _browse_inkscape_path(self): self._browse_executable_path(self.inkscape_path_edit, "Select Inkscape Executable")
-    def _browse_gimp_path(self): self._browse_executable_path(self.gimp_path_edit, "Select GIMP Executable")
-    def _accept_settings(self):
-        self.new_inkscape_path = self.inkscape_path_edit.text().strip()
-        self.new_gimp_path = self.gimp_path_edit.text().strip()
-        if self.new_inkscape_path and not os.path.isfile(self.new_inkscape_path):
-            QMessageBox.warning(self, "Invalid Inkscape Path", "Path is not a valid file."); return
-        if self.new_gimp_path and not os.path.isfile(self.new_gimp_path):
-            QMessageBox.warning(self, "Invalid GIMP Path", "Path is not a valid file."); return
-        self.accept()
+        # Inkscape Path
+        inkscape_layout = QHBoxLayout()
+        inkscape_layout.addWidget(QLabel("Inkscape Path:"))
+        self.inkscape_path_edit = QLineEdit(self.new_inkscape_path)
+        inkscape_layout.addWidget(self.inkscape_path_edit)
+        btn_browse_inkscape = QPushButton("Browse...")
+        btn_browse_inkscape.clicked.connect(self._browse_inkscape_path)
+        inkscape_layout.addWidget(btn_browse_inkscape)
+        layout.addLayout(inkscape_layout)
 
-# --- Main Application Window ---
+        # GIMP Path
+        gimp_layout = QHBoxLayout()
+        gimp_layout.addWidget(QLabel("GIMP Path:"))
+        self.gimp_path_edit = QLineEdit(self.new_gimp_path)
+        gimp_layout.addWidget(self.gimp_path_edit)
+        btn_browse_gimp = QPushButton("Browse...")
+        btn_browse_gimp.clicked.connect(self._browse_gimp_path)
+        gimp_layout.addWidget(btn_browse_gimp)
+        layout.addLayout(gimp_layout)
+
+        # LibreOffice Draw Path (New Section)
+        libreoffice_draw_layout = QHBoxLayout()
+        libreoffice_draw_layout.addWidget(QLabel("LibreOffice Draw Path:"))
+        self.libreoffice_draw_path_edit = QLineEdit(self.new_libreoffice_draw_path)
+        libreoffice_draw_layout.addWidget(self.libreoffice_draw_path_edit)
+        btn_browse_libreoffice_draw = QPushButton("Browse...")
+        btn_browse_libreoffice_draw.clicked.connect(self._browse_libreoffice_draw_path)
+        libreoffice_draw_layout.addWidget(btn_browse_libreoffice_draw)
+        layout.addLayout(libreoffice_draw_layout)
+
+        # Delete Originals Checkbox
+        self.delete_originals_checkbox = QCheckBox("Delete original files after successful conversion/combination")
+        self.delete_originals_checkbox.setChecked(self.new_delete_originals_on_action) # Corrected
+        layout.addWidget(self.delete_originals_checkbox)
+
+        # Ordering Keywords
+        keywords_layout = QHBoxLayout()
+        keywords_layout.addWidget(QLabel("Filename Ordering Keywords (JSON):"))
+        self.ordering_keywords_edit = QLineEdit(json.dumps(self.new_ordering_keywords)) # Corrected
+        self.ordering_keywords_edit.setReadOnly(True) 
+        keywords_layout.addWidget(self.ordering_keywords_edit)
+        btn_edit_keywords = QPushButton("Edit Keywords...")
+        btn_edit_keywords.clicked.connect(self._edit_keywords)
+        keywords_layout.addWidget(btn_edit_keywords)
+        layout.addLayout(keywords_layout)
+
+        # Dialog Buttons
+        self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def _browse_inkscape_path(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Inkscape Executable", os.path.dirname(self.new_inkscape_path) or os.path.expanduser("~"))
+        if path:
+            self.inkscape_path_edit.setText(path)
+
+    def _browse_gimp_path(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select GIMP Executable", os.path.dirname(self.gimp_path_edit.text()) or os.path.expanduser("~"))
+        if path:
+            self.gimp_path_edit.setText(path)
+
+    def _browse_libreoffice_draw_path(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select LibreOffice Draw Executable", os.path.dirname(self.libreoffice_draw_path_edit.text()) or os.path.expanduser("~"))
+        if path:
+            self.libreoffice_draw_path_edit.setText(path)
+
+    def _edit_keywords(self):
+        # Launch a simple editor dialog for now
+        editor_dialog = QDialog(self)
+        editor_dialog.setWindowTitle("Edit Ordering Keywords")
+        editor_dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(editor_dialog)
+
+        text_edit = QLineEdit(json.dumps(self.new_ordering_keywords, indent=4))
+        text_edit.setText(json.dumps(self.new_ordering_keywords, indent=4))
+        layout.addWidget(text_edit)
+
+        btn_ok = QPushButton("OK")
+        btn_ok.clicked.connect(lambda: self._on_keywords_edit_accept(text_edit.text(), editor_dialog))
+        layout.addWidget(btn_ok)
+
+        editor_dialog.exec()
+
+    def _on_keywords_edit_accept(self, text, dialog):
+        try:
+            # Attempt to load the JSON from the text edit
+            parsed_keywords = json.loads(text)
+            if isinstance(parsed_keywords, dict):
+                self.new_ordering_keywords = parsed_keywords
+                self.ordering_keywords_edit.setText(json.dumps(parsed_keywords))
+                dialog.accept()
+            else:
+                QMessageBox.warning(self, "Invalid Format", "Keywords must be a valid JSON object.")
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, "JSON Decode Error", f"Failed to decode JSON: {e}")
+
+    def accept(self):
+        self.new_inkscape_path = self.inkscape_path_edit.text()
+        self.new_gimp_path = self.gimp_path_edit.text()
+        self.new_libreoffice_draw_path = self.libreoffice_draw_path_edit.text() # Store new path
+        self.new_delete_originals_on_action = self.delete_originals_checkbox.isChecked()
+        # self.new_ordering_keywords is updated directly by KeywordsEditorDialog
+        super().accept()
+
 class PDFToolApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("File Management Tool"); self.setGeometry(100, 100, 900, 700)
-        self.config = load_config(); self.last_created_pdf_path = None
-        self.main_gui_file_items = [] 
-        self._create_menu()
-        central_widget = QWidget(self); self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget); main_layout.setSpacing(10); central_widget.setContentsMargins(10,10,10,10)
+        self.config = load_config()
+        self.current_factory_paperwork_dir = self.config.get('factory_paperwork_dir', None)
+        self.preview_worker = None
+        self.preview_cache = {}
+        self.last_previewed_path = None
+        self._init_ui()
+        self._load_all_lists()
+        self.setWindowTitle("PDF Management Tool")
+        self.setGeometry(100, 100, 1200, 800)
+        self.resizeEvent = self._on_resize_event
+
+    def _init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        file_management_widget = QWidget()
+        file_management_layout = QVBoxLayout(file_management_widget)
+
+        dir_layout = QHBoxLayout()
+        self.factory_paperwork_dir_label = QLabel(f"Factory Paperwork (0 items): {self.current_factory_paperwork_dir or 'Not set'}")
+        dir_layout.addWidget(self.factory_paperwork_dir_label, 1)
+        self.btn_set_factory_paperwork_dir = QPushButton("Set Source Directory")
+        self.btn_set_factory_paperwork_dir.clicked.connect(self._set_factory_paperwork_dir)
+        dir_layout.addWidget(self.btn_set_factory_paperwork_dir)
+        file_management_layout.addLayout(dir_layout)
+
+        source_files_layout = QVBoxLayout()
+        source_files_layout.addWidget(QLabel("Available Files (Source)"))
+        self.source_files_list = QListWidget()
+        self.source_files_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.source_files_list.itemSelectionChanged.connect(self._update_button_states)
+        self.source_files_list.itemDoubleClicked.connect(self._add_to_selected_list_handler)
+        self.source_files_list.itemClicked.connect(self._handle_source_file_click)
+        source_files_layout.addWidget(self.source_files_list)
+        file_management_layout.addLayout(source_files_layout, 3)
+
+        source_action_layout = QHBoxLayout()
+        self.btn_add_to_selection = QPushButton("Add to Combine List ->")
+        self.btn_add_to_selection.clicked.connect(self._add_to_selected_list_handler)
+        source_action_layout.addWidget(self.btn_add_to_selection)
+        self.btn_open_inkscape = QPushButton("Open with Inkscape")
+        self.btn_open_inkscape.clicked.connect(self._open_selected_pdf_with_inkscape)
+        source_action_layout.addWidget(self.btn_open_inkscape)
+        self.btn_open_gimp = QPushButton("Open with GIMP")
+        self.btn_open_gimp.clicked.connect(self._open_selected_png_with_gimp)
+        source_action_layout.addWidget(self.btn_open_gimp)
+        source_action_layout.addStretch()
+        file_management_layout.addLayout(source_action_layout)
+
+        conversion_action_layout = QHBoxLayout()
+        self.btn_convert_pdf_to_png = QPushButton("PDF to PNG")
+        self.btn_convert_pdf_to_png.clicked.connect(self._convert_selected_pdf_to_png)
+        conversion_action_layout.addWidget(self.btn_convert_pdf_to_png)
+        self.btn_convert_png_to_pdf = QPushButton("PNG to PDF")
+        self.btn_convert_png_to_pdf.clicked.connect(self._convert_selected_png_to_pdf)
+        conversion_action_layout.addWidget(self.btn_convert_png_to_pdf)
+        conversion_action_layout.addStretch()
+        file_management_layout.addLayout(conversion_action_layout)
+
+        selected_files_layout = QVBoxLayout()
+        selected_files_layout.addWidget(QLabel("Files Selected for Combination (Ordered)"))
+        self.selected_files_list = QListWidget()
+        self.selected_files_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.selected_files_list.itemSelectionChanged.connect(self._update_button_states)
+        self.selected_files_list.itemClicked.connect(self._handle_selected_file_click)
+        selected_files_layout.addWidget(self.selected_files_list)
         
-        dir_setup_group = QGroupBox("Directory Setup"); dir_setup_layout = QVBoxLayout()
-        source_layout = QHBoxLayout(); source_layout.addWidget(QLabel("Originals Folder (PDFs, PNGs):"))
-        self.source_dir_edit = QLineEdit(self.config.get('source_pdf_dir', ''))
-        self.source_dir_edit.editingFinished.connect(self._update_config_and_refresh_display) # Changed
-        source_layout.addWidget(self.source_dir_edit, 1); btn_src = QPushButton("Browse..."); btn_src.clicked.connect(self._browse_source_dir)
-        source_layout.addWidget(btn_src); dir_setup_layout.addLayout(source_layout)
-        factory_layout = QHBoxLayout(); factory_layout.addWidget(QLabel("Factory Paperwork Folder:"))
-        self.factory_dir_edit = QLineEdit(self.config.get('factory_paperwork_dir', ''))
-        self.factory_dir_edit.editingFinished.connect(self._update_config_and_refresh_display) # Changed
-        factory_layout.addWidget(self.factory_dir_edit, 1); btn_fact = QPushButton("Browse..."); btn_fact.clicked.connect(self._browse_factory_dir)
-        factory_layout.addWidget(btn_fact); dir_setup_layout.addLayout(factory_layout)
-        dir_setup_group.setLayout(dir_setup_layout); main_layout.addWidget(dir_setup_group)
+        selected_action_layout = QHBoxLayout()
+        self.btn_remove_from_selection = QPushButton("<- Remove from Combine List")
+        self.btn_remove_from_selection.clicked.connect(self._remove_from_selected_list_handler)
+        selected_action_layout.addWidget(self.btn_remove_from_selection)
+        selected_action_layout.addStretch()
+        selected_files_layout.addLayout(selected_action_layout)
 
-        contents_group = QGroupBox("Factory Paperwork Folder Contents"); contents_layout = QVBoxLayout()
-        self.view_mode_stack = QStackedWidget()
-        self._create_list_view_page(); self._create_preview_view_page()
-        contents_layout.addWidget(self.view_mode_stack)
-        btn_toggle_view = QPushButton("Toggle View Mode"); btn_toggle_view.clicked.connect(self._toggle_view_mode)
-        contents_layout.addWidget(btn_toggle_view, 0, Qt.AlignmentFlag.AlignRight)
-        contents_group.setLayout(contents_layout)
-        main_layout.addWidget(contents_group)
-        contents_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.btn_combine_files = QPushButton("Combine Selected Files into PDF")
+        self.btn_combine_files.clicked.connect(self._perform_pdf_combination)
+        selected_files_layout.addWidget(self.btn_combine_files)
 
-        actions_group = QGroupBox("Actions"); actions_main_layout = QVBoxLayout() 
-        copy_layout = QHBoxLayout(); copy_layout.addStretch()
-        self.copy_button = QPushButton("Copy Files to Factory Folder"); self.copy_button.clicked.connect(self._copy_files)
-        copy_layout.addWidget(self.copy_button); copy_layout.addStretch(); actions_main_layout.addLayout(copy_layout)
-        compile_actions_group = QGroupBox("Compilation Actions"); compile_actions_layout = QHBoxLayout()
-        self.combine_all_button = QPushButton("Combine ALL (Main View Order)"); self.combine_all_button.clicked.connect(self._combine_all_files_from_main_gui)
-        self.selective_compile_button = QPushButton("Combine SELECTED (Main View)"); self.selective_compile_button.clicked.connect(self._selective_compile_files_from_main_gui)
-        compile_actions_layout.addWidget(self.combine_all_button); compile_actions_layout.addWidget(self.selective_compile_button)
-        compile_actions_group.setLayout(compile_actions_layout); actions_main_layout.addWidget(compile_actions_group)
-        edit_actions_group = QGroupBox("External Editing Actions"); edit_actions_layout = QHBoxLayout()
-        self.open_last_pdf_inkscape_button = QPushButton("Open Last Output PDF in Inkscape"); self.open_last_pdf_inkscape_button.clicked.connect(self._open_last_pdf_in_inkscape); self.open_last_pdf_inkscape_button.setEnabled(False)
-        self.open_selected_inkscape_button = QPushButton("Open SELECTED in Inkscape"); self.open_selected_inkscape_button.clicked.connect(self._open_selected_in_inkscape); self.open_selected_inkscape_button.setEnabled(False)
-        self.open_gimp_button = QPushButton("Open SELECTED in GIMP"); self.open_gimp_button.clicked.connect(self._open_selected_in_gimp); self.open_gimp_button.setEnabled(False)
-        edit_actions_layout.addWidget(self.open_last_pdf_inkscape_button); edit_actions_layout.addWidget(self.open_selected_inkscape_button); edit_actions_layout.addWidget(self.open_gimp_button)
-        
-        # Add the new button for Image Blender
-        self.open_image_blender_button = QPushButton("Open Image Blender")
-        self.open_image_blender_button.clicked.connect(self._open_image_blender)
-        edit_actions_layout.addWidget(self.open_image_blender_button) # Add to the same layout as other edit actions
+        # Toggles for opening after combination
+        combination_options_layout = QHBoxLayout()
+        self.open_in_inkscape_checkbox = QCheckBox("Open combined PDF in Inkscape")
+        self.open_in_inkscape_checkbox.setChecked(self.config.get('open_combined_in_inkscape', False))
+        combination_options_layout.addWidget(self.open_in_inkscape_checkbox)
 
-        edit_actions_group.setLayout(edit_actions_layout); actions_main_layout.addWidget(edit_actions_group)
-        actions_group.setLayout(actions_main_layout); main_layout.addWidget(actions_group)
-        
-        status_msg = "Ready."
-        if not PYMUPDF_AVAILABLE: status_msg += " PyMuPDF not found: PDF previews & PNG inclusion disabled."
-        self.statusBar().showMessage(status_msg)
-        self._update_button_states(); self._refresh_factory_folder_display()
+        self.open_in_libreoffice_checkbox = QCheckBox("Open combined PDF in LibreOffice Draw")
+        self.open_in_libreoffice_checkbox.setChecked(self.config.get('open_combined_in_libreoffice', False))
+        combination_options_layout.addWidget(self.open_in_libreoffice_checkbox)
+        selected_files_layout.addLayout(combination_options_layout)
 
-    def _create_list_view_page(self):
-        self.list_view_page = QWidget()
-        list_scroll_area = QScrollArea(); list_scroll_area.setWidgetResizable(True)
-        self.list_view_widget_content = QWidget() 
-        self.list_view_layout = QVBoxLayout(self.list_view_widget_content)
-        self.list_view_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        list_scroll_area.setWidget(self.list_view_widget_content)
-        page_layout = QVBoxLayout(self.list_view_page); page_layout.addWidget(list_scroll_area)
-        self.view_mode_stack.addWidget(self.list_view_page)
+        file_management_layout.addLayout(selected_files_layout, 3)
+        self.main_splitter.addWidget(file_management_widget)
 
-    def _create_preview_view_page(self):
-        self.preview_view_page = QWidget()
-        preview_scroll_area = QScrollArea(); preview_scroll_area.setWidgetResizable(True)
-        self.preview_view_widget_content = QWidget()
-        self.preview_view_layout = QVBoxLayout(self.preview_view_widget_content) 
-        self.preview_view_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        preview_scroll_area.setWidget(self.preview_view_widget_content)
-        page_layout = QVBoxLayout(self.preview_view_page); page_layout.addWidget(preview_scroll_area)
-        self.view_mode_stack.addWidget(self.preview_view_page)
+        self.preview_widget = QWidget()
+        preview_layout = QVBoxLayout(self.preview_widget)
+        self.toggle_preview_checkbox = QCheckBox("Show File Preview")
+        self.toggle_preview_checkbox.setChecked(self.config.get('show_preview', True))
+        self.toggle_preview_checkbox.stateChanged.connect(self._toggle_preview_visibility)
+        preview_layout.addWidget(self.toggle_preview_checkbox)
 
-    def _clear_layout(self, layout):
-        if layout is not None:
-            while layout.count():
-                item = layout.takeAt(0); widget = item.widget()
-                if widget is not None: widget.setParent(None); widget.deleteLater() # Ensure proper cleanup
-                else:
-                    sub_layout = item.layout()
-                    if sub_layout is not None: self._clear_layout(sub_layout)
-    
-    def _render_main_gui_file_display(self):
-        """Sorts main_gui_file_items and re-populates both view layouts."""
-        self._clear_layout(self.list_view_layout)
-        self._clear_layout(self.preview_view_layout)
+        self.preview_label = QLabel("Select a file to preview")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumSize(200, 200)
+        self.preview_label.setStyleSheet("border: 1px solid gray; background-color: #f0f0f0;")
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        preview_layout.addWidget(self.preview_label, 1)
+        self.main_splitter.addWidget(self.preview_widget)
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 1)
+        self._toggle_preview_visibility()
 
-        if not self.main_gui_file_items: # Handle case where list might be empty after operations
-            no_files_msg = "No PDF or PNG files found in folder."
-            self.list_view_layout.addWidget(QLabel(no_files_msg))
-            self.preview_view_layout.addWidget(QLabel(no_files_msg))
-            self._update_button_states()
-            return
+        main_layout.addWidget(self.main_splitter)
 
-        # Sort the items based on their 'order' attribute
-        self.main_gui_file_items.sort(key=lambda item: item['order'])
+        settings_button_layout = QHBoxLayout()
+        settings_button_layout.addStretch()
+        self.btn_settings = QPushButton("Settings")
+        self.btn_settings.clicked.connect(self._show_settings_dialog)
+        settings_button_layout.addWidget(self.btn_settings)
 
-        # Re-populate both views with the sorted items
-        for item_data in self.main_gui_file_items:
-            # List View Item
-            list_item_layout = QHBoxLayout()
-            list_item_layout.addWidget(item_data['list_view_widgets']['checkbox'])
-            list_fn_label = QLabel(item_data['filename']); list_fn_label.setWordWrap(True)
-            list_item_layout.addWidget(list_fn_label, 1)
-            list_item_layout.addWidget(item_data['list_view_widgets']['spinbox'])
-            self.list_view_layout.addLayout(list_item_layout)
+        self.btn_open_blender = QPushButton("Open Image Blender") # New Button
+        self.btn_open_blender.clicked.connect(self._open_image_blender) # New Slot
+        settings_button_layout.addWidget(self.btn_open_blender) # Add to layout
 
-            # Preview View Item
-            preview_item_layout = QHBoxLayout()
-            preview_item_layout.addWidget(item_data['preview_view_widgets']['checkbox'])
-            
-            preview_label_widget = QLabel() # Create new label for preview image each render
-            preview_label_widget.setFixedSize(PREVIEW_WIDTH, PREVIEW_HEIGHT + 10)
-            preview_label_widget.setStyleSheet("border: 1px solid #ccc; background-color: #f0f0f0; padding: 5px;")
-            preview_label_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            qpixmap = generate_file_preview(item_data['full_path'])
-            if qpixmap: preview_label_widget.setPixmap(qpixmap)
-            else: preview_label_widget.setText("Preview N/A")
-            
-            preview_fn_label = QLabel(f"{item_data['filename']}"); preview_fn_label.setWordWrap(True)
-            details_layout = QVBoxLayout(); details_layout.addWidget(preview_fn_label)
-            details_layout.addWidget(item_data['preview_view_widgets']['spinbox']) # Add existing spinbox
-            
-            preview_item_layout.addWidget(preview_label_widget)
-            preview_item_layout.addLayout(details_layout,1)
-            self.preview_view_layout.addLayout(preview_item_layout)
-        self._update_button_states()
+        main_layout.addLayout(settings_button_layout)
 
-
-    def _refresh_factory_folder_display(self):
-        # Clear existing items and their widgets before fetching new ones
-        for item_data in self.main_gui_file_items:
-            item_data['list_view_widgets']['checkbox'].setParent(None)
-            item_data['list_view_widgets']['spinbox'].setParent(None)
-            item_data['preview_view_widgets']['checkbox'].setParent(None)
-            item_data['preview_view_widgets']['spinbox'].setParent(None)
-        self.main_gui_file_items.clear()
-        
-        # Note: _clear_layout is called by _render_main_gui_file_display, so not needed here if we call render.
-
-        factory_dir = self.config.get('factory_paperwork_dir', '')
-        if not factory_dir or not os.path.isdir(factory_dir):
-            self._render_main_gui_file_display() # Render with empty items to show message
-            return
-        try: files = self._get_processable_files_from_factory_folder(show_msg_if_empty=False)
-        except Exception:
-            self._render_main_gui_file_display() # Render with empty items to show message
-            return
-        if not files:
-            self._render_main_gui_file_display() # Render with empty items to show message
-            return
-
-        # Initial sort based on filename properties
-        sorted_files_by_name = sorted(files, key=lambda fn: get_file_sort_priority(fn, self.config['ordering_keywords']))
-        num_files = len(sorted_files_by_name); max_order_val = max(1, num_files)
-
-        for i, filename_short in enumerate(sorted_files_by_name):
-            full_path = os.path.join(factory_dir, filename_short)
-            
-            # Create new widgets for this item
-            cb_list = QCheckBox(); sb_list = QSpinBox(); sb_list.setMinimum(1); sb_list.setMaximum(max_order_val); sb_list.setValue(i + 1)
-            cb_preview = QCheckBox(); sb_preview = QSpinBox(); sb_preview.setMinimum(1); sb_preview.setMaximum(max_order_val); sb_preview.setValue(i + 1)
-
-            item_data = {
-                'filename': filename_short, 'full_path': full_path, 
-                'order': i + 1, # Initial order matches visual sort by name
-                'is_checked': False,
-                'list_view_widgets': {'checkbox': cb_list, 'spinbox': sb_list},
-                'preview_view_widgets': {'checkbox': cb_preview, 'spinbox': sb_preview}
-            }
-            self.main_gui_file_items.append(item_data)
-            
-            item_index = len(self.main_gui_file_items) - 1
-            cb_list.toggled.connect(lambda state, idx=item_index, src_view='list': self._handle_checkbox_toggled(idx, state, src_view))
-            sb_list.valueChanged.connect(lambda value, idx=item_index, src_view='list': self._handle_spinbox_value_changed(idx, value, src_view))
-            cb_preview.toggled.connect(lambda state, idx=item_index, src_view='preview': self._handle_checkbox_toggled(idx, state, src_view))
-            sb_preview.valueChanged.connect(lambda value, idx=item_index, src_view='preview': self._handle_spinbox_value_changed(idx, value, src_view))
-        
-        self._render_main_gui_file_display() # This will sort by 'order' and then populate UI
-
-    def _handle_checkbox_toggled(self, item_index, state, source_view_type):
-        if 0 <= item_index < len(self.main_gui_file_items):
-            item_data = self.main_gui_file_items[item_index]
-            item_data['is_checked'] = state
-            target_cb = item_data['preview_view_widgets']['checkbox'] if source_view_type == 'list' else item_data['list_view_widgets']['checkbox']
-            blocked = target_cb.blockSignals(True); target_cb.setChecked(state); target_cb.blockSignals(blocked)
-            self._update_button_states()
-
-    def _handle_spinbox_value_changed(self, item_index, new_value, source_view_type):
-        if not (0 <= item_index < len(self.main_gui_file_items)): return
-        self.main_gui_file_items[item_index]['order'] = new_value
-        item_data = self.main_gui_file_items[item_index]
-        target_sb = item_data['preview_view_widgets']['spinbox'] if source_view_type == 'list' else item_data['list_view_widgets']['spinbox']
-        blocked = target_sb.blockSignals(True); target_sb.setValue(new_value); target_sb.blockSignals(blocked)
-
-        for i, other_item_data in enumerate(self.main_gui_file_items):
-            if i == item_index: continue
-            if other_item_data['order'] == new_value:
-                current_orders = {item['order'] for idx, item in enumerate(self.main_gui_file_items) if idx != i}
-                placeholder_val = 1; num_items = len(self.main_gui_file_items)
-                while placeholder_val <= num_items and placeholder_val in current_orders : placeholder_val += 1
-                if placeholder_val > num_items:
-                    temp_val = 1; all_orders = {item['order'] for item in self.main_gui_file_items}
-                    while temp_val in all_orders: temp_val +=1
-                    placeholder_val = temp_val
-                
-                other_item_data['order'] = placeholder_val
-                sb_list_disp = other_item_data['list_view_widgets']['spinbox']
-                sb_prev_disp = other_item_data['preview_view_widgets']['spinbox']
-                
-                bl_list = sb_list_disp.blockSignals(True); sb_list_disp.setValue(placeholder_val); sb_list_disp.blockSignals(bl_list)
-                bl_prev = sb_prev_disp.blockSignals(True); sb_prev_disp.setValue(placeholder_val); sb_prev_disp.blockSignals(bl_prev)
-                break 
-        self._render_main_gui_file_display() # Re-sort and re-render the UI
-
-    def _toggle_view_mode(self):
-        self.view_mode_stack.setCurrentIndex((self.view_mode_stack.currentIndex() + 1) % self.view_mode_stack.count())
-
-    def _create_menu(self):
-        menubar = self.menuBar(); settings_menu = menubar.addMenu("&Settings")
-        cfg_paths_action = QAction("&Configure Executable Paths...", self); cfg_paths_action.triggered.connect(self._show_settings_dialog)
-        settings_menu.addAction(cfg_paths_action)
-
-    def _show_settings_dialog(self):
-        dialog = SettingsDialog(self.config.get('inkscape_path', ''), self.config.get('gimp_path', ''), self)
-        if dialog.exec():
-            self.config['inkscape_path'] = dialog.new_inkscape_path; self.config['gimp_path'] = dialog.new_gimp_path
-            save_config(self.config); self.statusBar().showMessage("Executable paths updated.", 3000)
-            self._update_button_states()
-
-    def _update_button_states(self):
-        inkscape_path_set = bool(self.config.get('inkscape_path', ''))
-        gimp_path_set = bool(self.config.get('gimp_path', ''))
-        any_item_selected = any(item['is_checked'] for item in self.main_gui_file_items)
-        can_open_last_inkscape = self.last_created_pdf_path is not None and inkscape_path_set
-        self.open_last_pdf_inkscape_button.setEnabled(can_open_last_inkscape)
-        if can_open_last_inkscape: self.open_last_pdf_inkscape_button.setToolTip(f"Opens '{os.path.basename(self.last_created_pdf_path)}' in Inkscape")
-        elif inkscape_path_set: self.open_last_pdf_inkscape_button.setToolTip("Create a PDF first.")
-        else: self.open_last_pdf_inkscape_button.setToolTip("Set Inkscape path in Settings.")
-        self.open_selected_inkscape_button.setEnabled(inkscape_path_set and any_item_selected)
-        self.open_selected_inkscape_button.setToolTip("Open selected in Inkscape" if inkscape_path_set else "Set Inkscape path in Settings.")
-        self.open_gimp_button.setEnabled(gimp_path_set and any_item_selected)
-        self.open_gimp_button.setToolTip("Open selected in GIMP" if gimp_path_set else "Set GIMP path in Settings.")
-        self.selective_compile_button.setEnabled(any_item_selected)
-        self.combine_all_button.setEnabled(len(self.main_gui_file_items) > 0)
-
-    def _update_config_and_refresh_display(self):
-        self.config['source_pdf_dir'] = self.source_dir_edit.text().strip()
-        self.config['factory_paperwork_dir'] = self.factory_dir_edit.text().strip()
-        save_config(self.config)
-        self.statusBar().showMessage("Configuration updated. Refreshing display...", 3000)
-        self._refresh_factory_folder_display()
-
-    def _browse_dir(self, line_edit, title):
-        path = line_edit.text().strip() or os.path.expanduser("~")
-        directory = QFileDialog.getExistingDirectory(self, title, path)
-        if directory: line_edit.setText(directory); self._update_config_and_refresh_display()
-
-    def _browse_source_dir(self): self._browse_dir(self.source_dir_edit, "Select Source Files Directory")
-    def _browse_factory_dir(self): self._browse_dir(self.factory_dir_edit, "Select Factory Paperwork Directory")
-
-    def _copy_files(self):
-        source, factory = self.config.get('source_pdf_dir',''), self.config.get('factory_paperwork_dir','')
-        if not (os.path.isdir(source) and os.path.isdir(factory)): QMessageBox.warning(self, "Input Error", "Both source and factory directories must be valid."); return
-        copied, errors, found = 0, [], False; exts = ('.pdf', '.png')
-        try:
-            for f_name in os.listdir(source):
-                if f_name.lower().endswith(exts):
-                    found = True
-                    try: shutil.copy2(os.path.join(source, f_name), os.path.join(factory, f_name)); copied += 1
-                    except Exception as e: errors.append(f"'{f_name}': {e}")
-        except OSError as e: QMessageBox.critical(self, "Dir Error", f"Accessing source: {e}"); return
-        msg = ""
-        if not found: msg = "No PDF or PNG files in source."
-        elif errors: msg = f"Copied {copied} with errors: {', '.join(errors)}"
-        else: msg = f"Copied {copied} file(s) to factory folder."
-        self.statusBar().showMessage(msg); QMessageBox.information(self, "Copy Result", msg)
-        self._refresh_factory_folder_display()
-
-    def _get_processable_files_from_factory_folder(self, show_msg_if_empty=True):
-        factory_dir = self.config.get('factory_paperwork_dir', '')
-        if not os.path.isdir(factory_dir): 
-            if show_msg_if_empty: QMessageBox.warning(self, "Input Error", "Factory folder invalid."); 
-            return []
-        exts = ('.pdf', '.png')
-        try: files = [f for f in os.listdir(factory_dir) if f.lower().endswith(exts)]
-        except OSError as e: 
-            if show_msg_if_empty: QMessageBox.critical(self, "Dir Error", f"Accessing factory folder: {e}"); 
-            return []
-        if not files and show_msg_if_empty: QMessageBox.information(self, "No Files", "No PDF or PNG files in factory folder."); 
-        return files
-
-    def _combine_all_files_from_main_gui(self):
-        factory_dir = self.config.get('factory_paperwork_dir', '')
-        if not os.path.isdir(factory_dir): QMessageBox.warning(self, "Error", "Factory Paperwork Folder not set."); return
-        if not self.main_gui_file_items: QMessageBox.information(self, "No Files", "No files to combine."); return
-        orders_seen = set()
-        for item_data in self.main_gui_file_items:
-            order = item_data['order']
-            if order in orders_seen: QMessageBox.warning(self, "Order Conflict", f"Order {order} duplicated. Correct."); return
-            orders_seen.add(order)
-        sorted_items = sorted(self.main_gui_file_items, key=lambda x: x['order'])
-        ordered_paths = [item['full_path'] for item in sorted_items]
-        if not ordered_paths: QMessageBox.information(self, "No Files Ordered", "No files to combine."); return
-        self._execute_file_merge(ordered_paths, factory_dir, "Combined_All_Factory_Files.pdf")
-
-    def _selective_compile_files_from_main_gui(self):
-        factory_dir = self.config.get('factory_paperwork_dir', '')
-        if not os.path.isdir(factory_dir): QMessageBox.warning(self, "Input Error", "Factory folder invalid."); return
-        selected_items_data = [{'full_path': item['full_path'], 'order': item['order']} for item in self.main_gui_file_items if item['is_checked']]
-        if not selected_items_data: QMessageBox.information(self, "No Selection", "No files selected for compilation."); return
-        orders_seen = set()
-        for item in selected_items_data:
-            if item['order'] in orders_seen: QMessageBox.warning(self, "Order Conflict", f"Order {item['order']} duplicated among selected. Correct."); return
-            orders_seen.add(item['order'])
-        selected_items_data.sort(key=lambda x: x['order'])
-        ordered_paths = [item['full_path'] for item in selected_items_data]
-        self.statusBar().showMessage(f"{len(ordered_paths)} file(s) selected for compilation.")
-        self._execute_file_merge(ordered_paths, factory_dir, "Selective_Compilation_Output.pdf")
-            
-    def _execute_file_merge(self, paths_to_merge, save_dir, default_filename_base):
-        if not paths_to_merge: QMessageBox.information(self, "Merge Info", "No files to merge."); return
-        out_fn, _ = QFileDialog.getSaveFileName(self, "Save Combined PDF", os.path.join(save_dir, default_filename_base), "PDF Files (*.pdf)")
-        if not out_fn: self.statusBar().showMessage("Save cancelled."); return
-        if not out_fn.lower().endswith(".pdf"): out_fn += ".pdf"
-        merger = PdfWriter(); processed_one_file = False
-        try:
-            self.statusBar().showMessage(f"Combining {len(paths_to_merge)} files...")
-            QApplication.processEvents()
-            for i, p_path in enumerate(paths_to_merge):
-                self.statusBar().showMessage(f"Processing {i+1}/{len(paths_to_merge)}: {os.path.basename(p_path)}...")
-                QApplication.processEvents()
-                try:
-                    if p_path.lower().endswith(".pdf"):
-                        merger.append(p_path); processed_one_file = True
-                    elif p_path.lower().endswith(".png"):
-                        if not PYMUPDF_AVAILABLE: QMessageBox.warning(self, "Missing Dependency", f"PNG '{os.path.basename(p_path)}' skipped. PyMuPDF required."); continue
-                        img_doc = fitz.open(p_path); pdf_bytes = img_doc.convert_to_pdf(); img_doc.close()
-                        if pdf_bytes: merger.append(PdfReader(io.BytesIO(pdf_bytes))); processed_one_file = True
-                        else: QMessageBox.warning(self, "PNG Error", f"Could not convert PNG '{os.path.basename(p_path)}'. Skipped.")
-                except Exception as e_app: QMessageBox.warning(self, "File Error", f"Could not process '{os.path.basename(p_path)}': {e_app}\nSkipped.");
-            if not processed_one_file or not merger.pages:
-                 QMessageBox.warning(self, "Combine Error", "No pages/files processed. PDF not created.")
-                 self.statusBar().showMessage("No content to combine."); self.last_created_pdf_path = None; self._update_button_states(); return
-            with open(out_fn, "wb") as f_out: merger.write(f_out)
-            self.last_created_pdf_path = out_fn
-            self.statusBar().showMessage(f"Successfully combined into {os.path.basename(out_fn)}", 7000)
-            QMessageBox.information(self, "Combine Successful", f"{len(merger.pages)} page(s) combined into:\n{out_fn}")
-        except Exception as e:
-            self.last_created_pdf_path = None; self.statusBar().showMessage(f"Error combining: {e}")
-            QMessageBox.critical(self, "Combine Error", f"Unexpected error: {e}")
-        finally: merger.close(); self._update_button_states()
+        self.statusBar().showMessage("Ready")
+        self.setAcceptDrops(True)
 
     def _open_image_blender(self):
-        from image_blender_gui import ImageBlenderWindow
-        blender_dialog = ImageBlenderWindow(self)
-        blender_dialog.exec()
+        # Check if an instance already exists, if so, bring to front
+        # For simplicity, we create a new one each time. 
+        # A more robust app might manage instances.
+        if not hasattr(self, 'image_blender_window') or not self.image_blender_window.isVisible():
+            # Dynamically import ImageBlenderWindow to avoid circular dependency if it were in the same file
+            # and to ensure it's only imported when needed.
+            try:
+                from image_blender_gui import ImageBlenderWindow
+                self.image_blender_window = ImageBlenderWindow(self) # Pass parent
+                self.image_blender_window.show()
+            except ImportError as e:
+                QMessageBox.critical(self, "Import Error", f"Could not load Image Blender: {e}")
+                logger.error("Failed to import ImageBlenderWindow: %s", e)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Could not open Image Blender: {e}")
+                logger.error("Failed to open ImageBlenderWindow: %s", e, exc_info=True)
+        else:
+            self.image_blender_window.activateWindow() # Bring to front if already open
+            self.image_blender_window.raise_() # For some window managers
 
-    def _open_last_pdf_in_inkscape(self):
-        inkscape_path = self.config.get('inkscape_path', '')
-        if not inkscape_path or not os.path.isfile(inkscape_path): QMessageBox.warning(self, "Inkscape Not Configured", "Inkscape path invalid. Configure in Settings."); return
-        if not self.last_created_pdf_path or not os.path.exists(self.last_created_pdf_path): QMessageBox.information(self, "No PDF", "No recent PDF or file gone."); return
+    def _on_resize_event(self, event: QResizeEvent):
+        super().resizeEvent(event)
+        if self.preview_widget.isVisible() and self.last_previewed_path:
+            self._update_preview(self.last_previewed_path, force_regenerate=True)
+
+    def _handle_source_file_click(self, item):
+        if item:
+            file_path = item.data(Qt.ItemDataRole.UserRole)
+            self._update_preview(file_path)
+
+    def _handle_selected_file_click(self, item):
+        if item:
+            widget = self.selected_files_list.itemWidget(item)
+            if widget:
+                file_path = widget.full_path
+                self._update_preview(file_path)
+
+    def _load_source_files_list(self):
+        self.source_files_list.clear()
+        self.preview_cache.clear()
+        self.last_previewed_path = None
+        self.preview_label.setText("Select a file to preview")
+        self.preview_label.setPixmap(QPixmap())
+        count = 0
+        if self.current_factory_paperwork_dir and os.path.isdir(self.current_factory_paperwork_dir):
+            try:
+                all_files_in_dir = []
+                for entry in os.scandir(self.current_factory_paperwork_dir):
+                    if entry.is_file() and entry.name.lower().endswith( (".pdf", ".png") ):
+                        all_files_in_dir.append(entry.path)
+                
+                # Sort files based on keywords in their names, then by name
+                ordering_keywords = self.config.get('ordering_keywords', DEFAULT_ORDERING_KEYWORDS)
+                # Ensure ordering_keywords is a dictionary; if not, fallback to default.
+                if not isinstance(ordering_keywords, dict):
+                    logger.warning("Ordering keywords in config is not a dictionary. Falling back to defaults.")
+                    ordering_keywords = DEFAULT_ORDERING_KEYWORDS
+                
+                def get_sort_key(filepath):
+                    filename_lower = os.path.basename(filepath).lower()
+                    for keyword, order_val in ordering_keywords.items():
+                        if keyword in filename_lower:
+                            return (order_val, filename_lower)
+                    return (DEFAULT_ORDERING_KEYWORDS.get('other', 999), filename_lower) # Default for unmatched
+
+                sorted_files = sorted(all_files_in_dir, key=get_sort_key)
+
+                for file_path in sorted_files:
+                    item = QListWidgetItem(os.path.basename(file_path))
+                    item.setData(Qt.ItemDataRole.UserRole, file_path) # Store full path
+                    item.setToolTip(file_path) # Show full path on hover
+                    self.source_files_list.addItem(item)
+                    count += 1
+            except OSError as e:
+                QMessageBox.warning(self, "Directory Error", f"Error reading source directory {self.current_factory_paperwork_dir}: {e}")
+                logger.error("Error reading source directory %s: %s", self.current_factory_paperwork_dir, e)
+        
+        self.factory_paperwork_dir_label.setText(f"Factory Paperwork ({count} items): {self.current_factory_paperwork_dir or 'Not set'}")
+        self._update_button_states()
+
+    def _load_all_lists(self):
+        self._load_source_files_list()
+        self._update_button_states()
+
+    def _set_factory_paperwork_dir(self):
+        new_dir = QFileDialog.getExistingDirectory(self, "Select Factory Paperwork Directory", self.current_factory_paperwork_dir or os.path.expanduser("~"))
+        if new_dir:
+            self.current_factory_paperwork_dir = new_dir
+            self.config['factory_paperwork_dir'] = new_dir
+            save_config(self.config)
+            self.statusBar().showMessage(f"Factory Paperwork directory set to: {new_dir}", 3000)
+            self._load_all_lists()
+            self.selected_files_list.clear()
+        self._update_button_states()
+
+    def _add_to_selected_list_handler(self):
+        selected_source_items = self.source_files_list.selectedItems()
+        if not selected_source_items:
+            return
+
+        current_selected_paths = []
+        for i in range(self.selected_files_list.count()):
+            item = self.selected_files_list.item(i)
+            widget = self.selected_files_list.itemWidget(item)
+            if widget:
+                current_selected_paths.append(widget.full_path)
+        
+        initial_next_order = self.selected_files_list.count() + 1
+        items_added = False
+        for source_item in selected_source_items:
+            full_path = source_item.data(Qt.ItemDataRole.UserRole)
+            filename = source_item.text()
+            if full_path not in current_selected_paths:
+                list_item = QListWidgetItem(self.selected_files_list)
+                widget = OrderableListItemWidget(filename, full_path, initial_next_order)
+                widget.orderChanged.connect(self._selected_item_order_changed)
+                list_item.setSizeHint(widget.sizeHint())
+                self.selected_files_list.addItem(list_item)
+                self.selected_files_list.setItemWidget(list_item, widget)
+                current_selected_paths.append(full_path) # Add to list to prevent duplicates in same batch
+                initial_next_order +=1
+                items_added = True
+        
+        if items_added:
+            self._sort_selected_files_list_by_spinbox()
+        self._update_button_states()
+
+    def _remove_from_selected_list_handler(self):
+        selected_to_remove = self.selected_files_list.selectedItems()
+        if not selected_to_remove:
+            return
+        for item in selected_to_remove:
+            row = self.selected_files_list.row(item)
+            self.selected_files_list.takeItem(row)
+        self._update_button_states()
+
+    def _selected_item_order_changed(self):
+        self._sort_selected_files_list_by_spinbox()
+        self._update_button_states()
+
+    def _sort_selected_files_list_by_spinbox(self):
+        self.selected_files_list.blockSignals(True)
+        recreation_data = []
+        for i in range(self.selected_files_list.count()):
+            list_item = self.selected_files_list.item(i)
+            widget = self.selected_files_list.itemWidget(list_item)
+            if widget:
+                recreation_data.append({
+                    'order': widget.get_order(),
+                    'filename': widget.filename,
+                    'full_path': widget.full_path
+                })
+        recreation_data.sort(key=lambda x: (x['order'], x['filename']))
+        self.selected_files_list.clear()
+        for data in recreation_data:
+            new_list_item = QListWidgetItem(self.selected_files_list)
+            new_widget = OrderableListItemWidget(data['filename'], data['full_path'], data['order'])
+            new_widget.orderChanged.connect(self._selected_item_order_changed)
+            new_list_item.setSizeHint(new_widget.sizeHint())
+            self.selected_files_list.addItem(new_list_item)
+            self.selected_files_list.setItemWidget(new_list_item, new_widget)
+        self.selected_files_list.blockSignals(False)
+
+    def _update_button_states(self):
+        source_selected = bool(self.source_files_list.selectedItems())
+        self.btn_add_to_selection.setEnabled(source_selected)
+        can_open_inkscape = False
+        can_open_gimp = False
+        can_convert_pdf_to_png = False
+        can_convert_png_to_pdf = False
+
+        if source_selected and len(self.source_files_list.selectedItems()) == 1:
+            selected_item_text = self.source_files_list.selectedItems()[0].text().lower()
+            if selected_item_text.endswith(".pdf"):
+                if self.config.get('inkscape_path') and os.path.exists(self.config.get('inkscape_path')):
+                    can_open_inkscape = True
+                can_convert_pdf_to_png = True
+            elif selected_item_text.endswith(".png"):
+                if self.config.get('gimp_path') and os.path.exists(self.config.get('gimp_path')):
+                    can_open_gimp = True
+                can_convert_png_to_pdf = True
+        
+        self.btn_open_inkscape.setEnabled(can_open_inkscape)
+        self.btn_open_gimp.setEnabled(can_open_gimp)
+        self.btn_convert_pdf_to_png.setEnabled(can_convert_pdf_to_png)
+        self.btn_convert_png_to_pdf.setEnabled(can_convert_png_to_pdf)
+
+        selected_for_combination_selected = bool(self.selected_files_list.selectedItems())
+        self.btn_remove_from_selection.setEnabled(selected_for_combination_selected)
+        can_combine = self.selected_files_list.count() > 0
+        self.btn_combine_files.setEnabled(can_combine)
+
+    def _show_settings_dialog(self):
+        dialog = SettingsDialog(
+            self.config.get('inkscape_path', ''),
+            self.config.get('gimp_path', ''),
+            self.config.get('delete_originals_on_action', False),
+            self.config.get('ordering_keywords', DEFAULT_ORDERING_KEYWORDS),
+            self.config.get('libreoffice_draw_path', ''), # New arg
+            self
+        )
+        if dialog.exec():
+            self.config['inkscape_path'] = dialog.new_inkscape_path
+            self.config['gimp_path'] = dialog.new_gimp_path
+            self.config['libreoffice_draw_path'] = dialog.new_libreoffice_draw_path # Save new path
+            self.config['delete_originals_on_action'] = dialog.new_delete_originals_on_action
+            self.config['ordering_keywords'] = dialog.new_ordering_keywords
+            save_config(self.config)
+            self.statusBar().showMessage("Settings updated.", 3000)
+            self._load_source_files_list() # Reload to reflect potential keyword changes
+            self._update_button_states()
+
+    def _open_selected_pdf_with_inkscape(self):
+        if not self.config.get('inkscape_path') or not os.path.exists(self.config['inkscape_path']):
+            QMessageBox.warning(self, "Inkscape Not Configured", "Inkscape path is not set or invalid in Settings.")
+            return
+        selected_items = self.source_files_list.selectedItems()
+        if selected_items and selected_items[0].text().lower().endswith(".pdf"):
+            file_path = selected_items[0].data(Qt.ItemDataRole.UserRole)
+            try:
+                subprocess.Popen([self.config['inkscape_path'], file_path])
+                self.statusBar().showMessage(f"Opening {os.path.basename(file_path)} with Inkscape...", 2000)
+            except OSError as e:
+                QMessageBox.critical(self, "Error Opening File", f"Could not open {file_path} with Inkscape: {e}")
+        else:
+            QMessageBox.information(self, "Selection Error", "Please select a single PDF file from the 'Available Files' list.")
+
+    def _open_selected_png_with_gimp(self):
+        if not self.config.get('gimp_path') or not os.path.exists(self.config['gimp_path']):
+            QMessageBox.warning(self, "GIMP Not Configured", "GIMP path is not set or invalid in Settings.")
+            return
+        selected_items = self.source_files_list.selectedItems()
+        if selected_items and selected_items[0].text().lower().endswith(".png"):
+            file_path = selected_items[0].data(Qt.ItemDataRole.UserRole)
+            try:
+                subprocess.Popen([self.config['gimp_path'], file_path])
+                self.statusBar().showMessage(f"Opening {os.path.basename(file_path)} with GIMP...", 2000)
+            except OSError as e:
+                QMessageBox.critical(self, "Error Opening File", f"Could not open {file_path} with GIMP: {e}")
+        else:
+            QMessageBox.information(self, "Selection Error", "Please select a single PNG file from the 'Available Files' list.")
+
+    def _convert_selected_pdf_to_png(self):
+        selected_items = self.source_files_list.selectedItems()
+        if not selected_items or not selected_items[0].text().lower().endswith(".pdf"):
+            QMessageBox.warning(self, "Selection Error", "Please select a single PDF file to convert to PNG.")
+            return
+        
+        source_pdf_path = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        base, _ = os.path.splitext(source_pdf_path)
+        output_png_path = base + ".png"
+        
+        if os.path.exists(output_png_path):
+            reply = QMessageBox.question(self, "File Exists", f"{os.path.basename(output_png_path)} already exists. Overwrite?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                self.statusBar().showMessage("Conversion cancelled.", 2000)
+                return
+
+        progress = QProgressDialog("Converting PDF to PNG...", "Cancel", 0, 1, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        
         try:
-            self.statusBar().showMessage(f"Opening {os.path.basename(self.last_created_pdf_path)} in Inkscape...")
-            subprocess.Popen([inkscape_path, self.last_created_pdf_path])
-            self.statusBar().showMessage(f"Sent to Inkscape.", 5000)
-        except Exception as e: QMessageBox.critical(self, "Inkscape Error", f"Could not open in Inkscape: {e}")
+            doc = fitz.open(source_pdf_path)
+            if not doc.page_count:
+                QMessageBox.warning(self, "Empty PDF", "The selected PDF has no pages to convert.")
+                doc.close()
+                progress.close()
+                return
 
-    def _get_selected_files_from_main_gui(self):
-        return [item['full_path'] for item in self.main_gui_file_items if item['is_checked']]
+            page = doc.load_page(0)
+            pix = page.get_pixmap()
+            pix.save(output_png_path)
+            doc.close()
+            progress.setValue(1)
+            QMessageBox.information(self, "Conversion Successful", f"Converted {os.path.basename(source_pdf_path)} to {os.path.basename(output_png_path)}")
 
-    def _open_selected_in_inkscape(self):
-        inkscape_path = self.config.get('inkscape_path', '')
-        if not inkscape_path or not os.path.isfile(inkscape_path): QMessageBox.warning(self, "Inkscape Not Configured", "Inkscape path invalid. Configure in Settings."); return
-        selected_files = self._get_selected_files_from_main_gui()
-        if not selected_files: QMessageBox.information(self, "No Selection", "No files selected to open in Inkscape."); return
+            if self.config.get('delete_originals_on_action', False):
+                try:
+                    os.remove(source_pdf_path)
+                    self.statusBar().showMessage(f"Original PDF {os.path.basename(source_pdf_path)} deleted.", 3000)
+                except OSError as e_del:
+                    QMessageBox.warning(self, "Deletion Error", f"Failed to delete original PDF: {e_del}")
+            self._load_source_files_list()
+        except fitz.RuntimeError as e_fitz: # More specific fitz error
+            progress.setValue(1)
+            QMessageBox.critical(self, "Conversion Error", f"Failed to convert PDF to PNG (PyMuPDF error): {e_fitz}")
+        except IOError as e_io:
+            progress.setValue(1)
+            QMessageBox.critical(self, "Conversion Error", f"Failed to save PNG (IOError): {e_io}")
+        except Exception as e: # General fallback
+            progress.setValue(1)
+            logger.error("Unexpected error during PDF to PNG conversion: %s", e, exc_info=True)
+            QMessageBox.critical(self, "Conversion Error", f"An unexpected error occurred: {e}")
+        finally:
+            if progress.isVisible(): progress.close()
+
+    def _convert_selected_png_to_pdf(self):
+        selected_items = self.source_files_list.selectedItems()
+        if not selected_items or not selected_items[0].text().lower().endswith(".png"):
+            QMessageBox.warning(self, "Selection Error", "Please select a single PNG file to convert to PDF.")
+            return
+
+        source_png_path = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        base, _ = os.path.splitext(source_png_path)
+        output_pdf_path = base + ".pdf"
+
+        if os.path.exists(output_pdf_path):
+            reply = QMessageBox.question(self, "File Exists", f"{os.path.basename(output_pdf_path)} already exists. Overwrite?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                self.statusBar().showMessage("Conversion cancelled.", 2000)
+                return
+        
+        progress = QProgressDialog("Converting PNG to PDF...", "Cancel", 0, 1, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
         try:
-            for f_path in selected_files:
-                 self.statusBar().showMessage(f"Opening {os.path.basename(f_path)} in Inkscape...")
-                 subprocess.Popen([inkscape_path, f_path]) # Inkscape typically opens one file per new window/instance unless configured otherwise
-            self.statusBar().showMessage(f"Sent {len(selected_files)} file(s) to Inkscape.", 5000)
-        except Exception as e: QMessageBox.critical(self, "Inkscape Error", f"Could not open files in Inkscape: {e}")
+            img_doc = fitz.open(source_png_path)
+            pdf_bytes = img_doc.convert_to_pdf()
+            img_doc.close()
+            with open(output_pdf_path, "wb") as f_out:
+                f_out.write(pdf_bytes)
+            progress.setValue(1)
+            QMessageBox.information(self, "Conversion Successful", f"Converted {os.path.basename(source_png_path)} to {os.path.basename(output_pdf_path)}")
 
-    def _open_selected_in_gimp(self):
-        gimp_path = self.config.get('gimp_path', '')
-        if not gimp_path or not os.path.isfile(gimp_path): QMessageBox.warning(self, "GIMP Not Configured", "GIMP path invalid. Configure in Settings."); return
-        selected_files = self._get_selected_files_from_main_gui()
-        if not selected_files: QMessageBox.information(self, "No Selection", "No files selected to open in GIMP."); return
+            if self.config.get('delete_originals_on_action', False):
+                try:
+                    os.remove(source_png_path)
+                    self.statusBar().showMessage(f"Original PNG {os.path.basename(source_png_path)} deleted.", 3000)
+                except OSError as e_del:
+                    QMessageBox.warning(self, "Deletion Error", f"Failed to delete original PNG: {e_del}")
+            self._load_source_files_list()
+        except fitz.RuntimeError as e_fitz: # More specific fitz error
+            progress.setValue(1)
+            QMessageBox.critical(self, "Conversion Error", f"Failed to convert PNG to PDF (PyMuPDF error): {e_fitz}")
+        except IOError as e_io:
+            progress.setValue(1)
+            QMessageBox.critical(self, "Conversion Error", f"Failed to write PDF (IOError): {e_io}")
+        except Exception as e: # General fallback
+            progress.setValue(1)
+            logger.error("Unexpected error during PNG to PDF conversion: %s", e, exc_info=True)
+            QMessageBox.critical(self, "Conversion Error", f"An unexpected error occurred: {e}")
+        finally:
+            if progress.isVisible(): progress.close()
+
+    def _perform_pdf_combination(self):
+        if self.selected_files_list.count() == 0:
+            QMessageBox.warning(self, "No Files Selected", "Please add files to the 'Files Selected for Combination' list.")
+            return
+
+        ordered_files_to_combine = []
+        for i in range(self.selected_files_list.count()):
+            list_item = self.selected_files_list.item(i)
+            widget = self.selected_files_list.itemWidget(list_item)
+            if widget:
+                ordered_files_to_combine.append(widget.full_path)
+        
+        if not ordered_files_to_combine:
+            QMessageBox.warning(self, "Error", "Could not retrieve files from the selection list.")
+            return
+
+        output_base_dir_name = "Combined_Output"
+        if not self.current_factory_paperwork_dir or not os.path.isdir(self.current_factory_paperwork_dir):
+            fallback_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+            QMessageBox.warning(self, "Output Directory Issue", 
+                                f"Factory Paperwork directory is not set or invalid. Combined file will be saved in '{fallback_dir}'.")
+            output_dir_base = fallback_dir
+        else:
+            output_dir_base = self.current_factory_paperwork_dir
+        output_dir = os.path.join(output_dir_base, output_base_dir_name)
+
         try:
-            command = [gimp_path] + selected_files
-            self.statusBar().showMessage(f"Opening {len(selected_files)} file(s) in GIMP...")
-            subprocess.Popen(command)
-            self.statusBar().showMessage(f"Sent to GIMP.", 5000)
-        except Exception as e: QMessageBox.critical(self, "GIMP Error", f"Could not open in GIMP: {e}")
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            QMessageBox.critical(self, "Directory Error", f"Failed to create output directory {output_dir}: {e}")
+            return
 
-# --- Application Entry Point ---
-if __name__ == '__main__':
+        default_output_name = "Combined_Document.pdf"
+        output_filename, _ = QFileDialog.getSaveFileName(self, "Save Combined PDF As...",
+                                                         os.path.join(output_dir, default_output_name),
+                                                         "PDF Files (*.pdf)")
+        if not output_filename:
+            return
+
+        merger = PdfWriter()
+        temp_pdf_files_created = []
+        original_files_processed_for_deletion = []
+
+        progress = QProgressDialog("Combining files...", "Cancel", 0, len(ordered_files_to_combine), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        
+        try:
+            for i, file_path in enumerate(ordered_files_to_combine):
+                progress.setValue(i)
+                if progress.wasCanceled():
+                    self.statusBar().showMessage("Combination canceled by user.", 3000)
+                    break
+                self.statusBar().showMessage(f"Processing {os.path.basename(file_path)}...", 0)
+                actual_pdf_to_merge = None
+                if not os.path.exists(file_path):
+                    QMessageBox.warning(self, "File Not Found", f"File {os.path.basename(file_path)} no longer exists and will be skipped.")
+                    continue
+                if file_path.lower().endswith(".png"):
+                    try:
+                        img_doc = fitz.open(file_path)
+                        pdf_bytes = img_doc.convert_to_pdf()
+                        img_doc.close()
+                        temp_pdf_path = os.path.join(output_dir, f"_temp_conversion_{os.path.basename(file_path)}.pdf")
+                        with open(temp_pdf_path, "wb") as temp_f:
+                            temp_f.write(pdf_bytes)
+                        actual_pdf_to_merge = temp_pdf_path
+                        temp_pdf_files_created.append(temp_pdf_path)
+                        original_files_processed_for_deletion.append(file_path)
+                    except fitz.RuntimeError as e_conv_fitz:
+                        QMessageBox.warning(self, "PNG Conversion Error", f"Could not convert {os.path.basename(file_path)} to PDF (PyMuPDF error): {e_conv_fitz}")
+                        continue
+                    except IOError as e_conv_io:
+                        QMessageBox.warning(self, "PNG Conversion Error", f"Could not write temporary PDF for {os.path.basename(file_path)} (IOError): {e_conv_io}")
+                        continue
+                    except Exception as e_conv:
+                        logger.error("Unexpected error converting %s to PDF: %s", file_path, e_conv, exc_info=True)
+                        QMessageBox.warning(self, "PNG Conversion Error", f"Unexpected error converting {os.path.basename(file_path)}: {e_conv}")
+                        continue
+                elif file_path.lower().endswith(".pdf"):
+                    actual_pdf_to_merge = file_path
+                    original_files_processed_for_deletion.append(file_path)
+                else:
+                    self.statusBar().showMessage(f"Skipping unsupported file: {os.path.basename(file_path)}", 2000)
+                    continue
+                if actual_pdf_to_merge:
+                    try:
+                        merger.append(actual_pdf_to_merge)
+                    except pypdf_errors.PdfReadError as e_append_pdf:
+                        QMessageBox.warning(self, "PDF Append Error", f"Could not append {os.path.basename(file_path)} (pypdf error): {e_append_pdf}")
+                        if file_path in original_files_processed_for_deletion:
+                            original_files_processed_for_deletion.remove(file_path)
+                        continue
+                    except Exception as e_append:
+                        logger.error("Unexpected error appending %s: %s", file_path, e_append, exc_info=True)
+                        QMessageBox.warning(self, "PDF Append Error", f"Unexpected error appending {os.path.basename(file_path)}: {e_append}")
+                        if file_path in original_files_processed_for_deletion:
+                            original_files_processed_for_deletion.remove(file_path)
+                        continue
+            progress.setValue(len(ordered_files_to_combine))
+            if progress.wasCanceled():
+                QMessageBox.information(self, "Combination Canceled", "PDF combination was canceled.")
+            elif not merger.pages:
+                QMessageBox.information(self, "No Content", "No pages were successfully processed to combine.")
+            else:
+                merger.write(output_filename)
+                QMessageBox.information(self, "Combination Successful", f"Combined PDF saved as {os.path.basename(output_filename)}")
+                
+                # Save checkbox states to config
+                self.config['open_combined_in_inkscape'] = self.open_in_inkscape_checkbox.isChecked()
+                self.config['open_combined_in_libreoffice'] = self.open_in_libreoffice_checkbox.isChecked()
+                save_config(self.config)
+
+                # Open in Inkscape if checked and path is valid
+                if self.open_in_inkscape_checkbox.isChecked():
+                    inkscape_path = self.config.get('inkscape_path')
+                    if inkscape_path and os.path.exists(inkscape_path):
+                        try:
+                            subprocess.Popen([inkscape_path, output_filename])
+                            self.statusBar().showMessage(f"Opening {os.path.basename(output_filename)} with Inkscape...", 2000)
+                        except OSError as e_open:
+                            QMessageBox.critical(self, "Error Opening File", f"Could not open {output_filename} with Inkscape: {e_open}")
+                    else:
+                        QMessageBox.warning(self, "Inkscape Not Configured", "Inkscape path is not set or invalid in Settings. Cannot open combined file.")
+
+                # Open in LibreOffice Draw if checked and path is valid
+                if self.open_in_libreoffice_checkbox.isChecked():
+                    libreoffice_draw_path = self.config.get('libreoffice_draw_path')
+                    if libreoffice_draw_path and os.path.exists(libreoffice_draw_path):
+                        try:
+                            subprocess.Popen([libreoffice_draw_path, output_filename])
+                            self.statusBar().showMessage(f"Opening {os.path.basename(output_filename)} with LibreOffice Draw...", 2000)
+                        except OSError as e_open:
+                            QMessageBox.critical(self, "Error Opening File", f"Could not open {output_filename} with LibreOffice Draw: {e_open}")
+                    else:
+                        QMessageBox.warning(self, "LibreOffice Draw Not Configured", "LibreOffice Draw path is not set or invalid in Settings. Cannot open combined file.")
+
+                if self.config.get('delete_originals_on_action', False) and not progress.wasCanceled():
+                    deleted_count = 0
+                    errors_deleting = []
+                    for f_path_orig in original_files_processed_for_deletion:
+                        try:
+                            if os.path.exists(f_path_orig) and f_path_orig not in temp_pdf_files_created:
+                                os.remove(f_path_orig)
+                                deleted_count += 1
+                        except OSError as e_del_os:
+                            errors_deleting.append(f"{os.path.basename(f_path_orig)} ({e_del_os.strerror})")
+                    if deleted_count > 0:
+                        self.statusBar().showMessage(f"{deleted_count} original file(s) deleted.", 3000)
+                    if errors_deleting:
+                        QMessageBox.warning(self, "Deletion Error", f"Failed to delete some original files: {', '.join(errors_deleting)}")
+                    self._load_source_files_list()
+                    self._reconcile_selected_files_list()
+        except pypdf_errors.PdfWriteError as e_main_pdf_write:
+            QMessageBox.critical(self, "Combination Error", f"Failed to write combined PDF (pypdf error): {e_main_pdf_write}")
+            if progress.isVisible(): progress.setValue(len(ordered_files_to_combine))
+        except IOError as e_main_io:
+            QMessageBox.critical(self, "Combination Error", f"An IO error occurred during PDF combination: {e_main_io}")
+            if progress.isVisible(): progress.setValue(len(ordered_files_to_combine))
+        except Exception as e_main:
+            logger.error("An unexpected error occurred during PDF combination: %s", e_main, exc_info=True)
+            QMessageBox.critical(self, "Combination Error", f"An unexpected error occurred: {e_main}")
+            if progress.isVisible(): progress.setValue(len(ordered_files_to_combine))
+        finally:
+            merger.close()
+            for temp_file in temp_pdf_files_created:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except OSError as e_clean:
+                    self.statusBar().showMessage(f"Error cleaning temporary file {os.path.basename(temp_file)}: {e_clean.strerror}", 3000)
+            if progress.isVisible(): progress.close()
+            self._update_button_states()
+
+    def _reconcile_selected_files_list(self):
+        items_to_remove_indices = []
+        for i in range(self.selected_files_list.count()):
+            list_item = self.selected_files_list.item(i)
+            widget = self.selected_files_list.itemWidget(list_item)
+            if widget and not os.path.exists(widget.full_path):
+                items_to_remove_indices.append(i)
+        for index in sorted(items_to_remove_indices, reverse=True):
+            self.selected_files_list.takeItem(index)
+        if items_to_remove_indices:
+            self.statusBar().showMessage("Some selected files were removed as originals no longer exist.", 3000)
+            self._sort_selected_files_list_by_spinbox()
+        self._update_button_states()
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        if not self.current_factory_paperwork_dir or not os.path.isdir(self.current_factory_paperwork_dir):
+            QMessageBox.warning(self, "Directory Not Set", "Cannot drop files: Factory Paperwork directory is not set.")
+            event.ignore()
+            return
+
+        mime_data = event.mimeData()
+        if mime_data.hasUrls():
+            event.acceptProposedAction()
+            files_to_add_to_source = []
+            import shutil # Moved import here
+            for url in mime_data.urls():
+                if url.isLocalFile():
+                    file_path = url.toLocalFile()
+                    if file_path.lower().endswith( (".pdf", ".png") ):
+                        dest_path = os.path.join(self.current_factory_paperwork_dir, os.path.basename(file_path))
+                        if os.path.abspath(file_path) == os.path.abspath(dest_path):
+                            self.statusBar().showMessage(f"{os.path.basename(file_path)} is already in the source directory.", 2000)
+                            continue
+                        if os.path.exists(dest_path):
+                            reply = QMessageBox.question(self, "File Exists", 
+                                                         f"{os.path.basename(dest_path)} already exists. Overwrite?",
+                                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                            if reply == QMessageBox.StandardButton.No:
+                                continue
+                        try:
+                            shutil.copy2(file_path, dest_path)
+                            files_to_add_to_source.append(dest_path)
+                            self.statusBar().showMessage(f"Copied {os.path.basename(file_path)} to source directory.", 2000)
+                        except OSError as e_copy:
+                            QMessageBox.warning(self, "Copy Error", f"Could not copy {os.path.basename(file_path)}: {e_copy}")
+                        except Exception as e_copy_general:
+                            logger.error("Unexpected error copying %s: %s", file_path, e_copy_general, exc_info=True)
+                            QMessageBox.warning(self, "Copy Error", f"An unexpected error occurred copying {os.path.basename(file_path)}: {e_copy_general}")
+                    else:
+                        logger.info("Skipped non-PDF/PNG file: %s", file_path)
+            if files_to_add_to_source:
+                self._load_source_files_list()
+                for added_path in files_to_add_to_source:
+                    items = self.source_files_list.findItems(os.path.basename(added_path), Qt.MatchFlag.MatchExactly)
+                    for item in items:
+                        if item.data(Qt.ItemDataRole.UserRole) == added_path:
+                            item.setSelected(True)
+                            self.source_files_list.scrollToItem(item)
+                            break
+        else:
+            event.ignore()
+
+    def _toggle_preview_visibility(self):
+        checked = self.toggle_preview_checkbox.isChecked()
+        self.preview_widget.setVisible(checked)
+        self.config['show_preview'] = checked
+        save_config(self.config)
+        if checked:
+            current_source_item = self.source_files_list.currentItem()
+            current_selected_item = self.selected_files_list.currentItem()
+            if current_selected_item:
+                widget = self.selected_files_list.itemWidget(current_selected_item)
+                if widget: self._update_preview(widget.full_path)
+            elif current_source_item:
+                self._update_preview(current_source_item.data(Qt.ItemDataRole.UserRole))
+            else:
+                self.preview_label.setText("Select a file to preview")
+                self.preview_label.setPixmap(QPixmap())
+        else:
+            self.preview_label.setText("Preview hidden")
+            self.preview_label.setPixmap(QPixmap())
+            self.last_previewed_path = None
+
+    def _update_preview(self, file_path, force_regenerate=False):
+        if not self.preview_widget.isVisible() or not file_path: # Ensure widget is visible and path is valid
+            self.preview_label.setPixmap(QPixmap()) # Clear pixmap if not visible or no path
+            self.preview_label.setText("Preview hidden or no file selected" if not file_path else "Preview hidden")
+            return
+
+        logger.debug(f"_update_preview called for: {file_path}, force_regenerate: {force_regenerate}")
+        current_label_size_for_debug = self.preview_label.size()
+        logger.debug(f"Preview widget visible: {self.preview_widget.isVisible()}, Preview label WxH: {current_label_size_for_debug.width()}x{current_label_size_for_debug.height()}")
+
+        # Cache key includes file path and a quantized version of the target label size for more accurate caching
+        current_label_size = self.preview_label.size()
+        quantize_factor = 20 # Group sizes by 20px blocks to reduce cache churn for minor size fluctuations
+        # Ensure a minimum size for cache key parts to avoid issues if label is transiently tiny during layout
+        cache_label_width = max(current_label_size.width(), quantize_factor)
+        cache_label_height = max(current_label_size.height(), quantize_factor)
+        # Quantize by rounding down to the nearest multiple of quantize_factor
+        label_size_tuple_for_cache = ( (cache_label_width // quantize_factor) * quantize_factor,
+                                       (cache_label_height // quantize_factor) * quantize_factor )
+        cache_key = (file_path, label_size_tuple_for_cache)
+        logger.debug(f"Using cache key: {cache_key}")
+
+        try:
+            if not force_regenerate and cache_key in self.preview_cache:
+                scaled_pixmap = self.preview_cache[cache_key]
+                logger.debug(f"Using cached preview for {cache_key}. Cached pixmap valid: {not scaled_pixmap.isNull()}, size: {scaled_pixmap.size().width()}x{scaled_pixmap.size().height()}")
+            else:
+                logger.debug(f"Generating new preview for {file_path} (target cache key {cache_key})")
+                pixmap = None # Initialize pixmap variable
+                if file_path.lower().endswith(".pdf"):
+                    doc = fitz.open(file_path)
+                    if not doc.page_count:
+                        self.preview_label.setText(f"Empty PDF: {os.path.basename(file_path)}")
+                        self.preview_label.setPixmap(QPixmap())
+                        doc.close()
+                        return
+                    page = doc.load_page(0) # Preview first page
+                    zoom = 2 # Increase DPI for better quality
+                    mat = fitz.Matrix(zoom, zoom)
+                    fitz_pix = page.get_pixmap(matrix=mat) # Renamed to fitz_pix to avoid confusion
+                    image_format = QImage.Format.Format_RGB888
+                    if fitz_pix.alpha:
+                         image_format = QImage.Format.Format_RGBA8888
+                    
+                    qimage = QImage(fitz_pix.samples, fitz_pix.width, fitz_pix.height, fitz_pix.stride, image_format)
+                    pixmap = QPixmap.fromImage(qimage) # Assign to general pixmap variable
+                    doc.close()
+                elif file_path.lower().endswith(".png"):
+                    pixmap = QPixmap(file_path) # Assign to general pixmap variable
+                else:
+                    self.preview_label.setText(f"Unsupported file type: {os.path.basename(file_path)}")
+                    self.preview_label.setPixmap(QPixmap())
+                    return
+
+                if pixmap is None or pixmap.isNull(): # Check the general pixmap variable
+                    logger.warning(f"Pixmap is null after loading attempt for {file_path}")
+                    self.preview_label.setText(f"Could not load preview for {os.path.basename(file_path)}")
+                    self.preview_label.setPixmap(QPixmap())
+                    if cache_key in self.preview_cache: # Remove potentially bad cache entry
+                        self.preview_cache.pop(cache_key, None)
+                    return
+                
+                logger.debug(f"Pixmap loaded from file: valid: {not pixmap.isNull()}, size: {pixmap.size().width()}x{pixmap.size().height()}")
+
+                # Scale pixmap to fit the label while maintaining aspect ratio
+                label_size_for_scaling = self.preview_label.size() # Use current actual size for scaling
+                # Subtract a small margin to avoid scrollbars if the label has a border/padding
+                available_width = max(1, label_size_for_scaling.width() - 4) 
+                available_height = max(1, label_size_for_scaling.height() - 4)
+                logger.debug(f"Scaling original pixmap (size {pixmap.size().width()}x{pixmap.size().height()}) to fit available space: {available_width}x{available_height}")
+
+                scaled_pixmap = pixmap.scaled(available_width, available_height,
+                                              Qt.AspectRatioMode.KeepAspectRatio,
+                                              Qt.TransformationMode.SmoothTransformation)
+                self.preview_cache[cache_key] = scaled_pixmap
+                logger.debug(f"Cached new preview. Scaled pixmap valid: {not scaled_pixmap.isNull()}, size: {scaled_pixmap.size().width()}x{scaled_pixmap.size().height()}")
+
+            self.preview_label.setPixmap(scaled_pixmap)
+            self.preview_label.setText("") # Clear any previous text like "Select a file"
+            self.last_previewed_path = file_path
+
+        except fitz.RuntimeError as e_fitz:
+            logger.error("PyMuPDF error generating preview for %s: %s", file_path, e_fitz, exc_info=False)
+            self.preview_label.setText(f"PyMuPDF error for {os.path.basename(file_path)}")
+            if file_path in self.preview_cache: del self.preview_cache[file_path]
+            self.last_previewed_path = None
+        except Exception as e:
+            logger.error("Error generating preview for %s: %s", file_path, e, exc_info=True)
+            self.preview_label.setText(f"Error previewing {os.path.basename(file_path)}")
+            if file_path in self.preview_cache: del self.preview_cache[file_path]
+            self.last_previewed_path = None
+
+
+def main():
     app = QApplication(sys.argv)
-    if not PYMUPDF_AVAILABLE:
-         QMessageBox.warning(None, "Missing Dependency: PyMuPDF", 
-                               "PyMuPDF (fitz) not installed.\n- PDF previews disabled.\n- PNGs cannot be included in combined PDFs.\nInstall: pip install PyMuPDF")
-    main_window = PDFToolApp(); main_window.show(); sys.exit(app.exec())
+    # Apply a style if desired, e.g., Fusion for a modern look
+    # app.setStyle("Fusion") 
+    window = PDFToolApp()
+    window.show()
+    sys.exit(app.exec())
+
+if __name__ == '__main__':
+    main()

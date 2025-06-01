@@ -1,0 +1,20 @@
+{
+    "factory_paperwork_dir": "D:/Work - Big Files/1150401 _ Q63083 - Costa Concreto - Copy/1150401 _ Q63083 - Costa Concreto - Copy",
+    "inkscape_path": "C:/Program Files/Inkscape/bin/inkscape.exe",
+    "gimp_path": "C:/Users/User/AppData/Local/Programs/GIMP 3/bin/gimp-3.exe",
+    "ordering_keywords": {
+        "drawing": 10,
+        "plan": 20,
+        "detail": 30,
+        "schedule": 40,
+        "specification": 50,
+        "report": 60,
+        "photo": 70,
+        "other": 100
+    },
+    "delete_originals_on_action": false,
+    "show_preview": false,
+    "libreoffice_draw_path": "C:/Program Files/LibreOffice/program/sdraw.exe",
+    "open_combined_in_inkscape": false,
+    "open_combined_in_libreoffice": true
+}
