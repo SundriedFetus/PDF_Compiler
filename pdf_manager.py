@@ -1,5 +1,12 @@
 import sys
 import os
+
+# Add lib directory to Python path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+lib_dir = os.path.join(script_dir, 'lib')
+if lib_dir not in sys.path:
+    sys.path.insert(0, lib_dir)
+
 import shutil
 import json
 import re
@@ -174,6 +181,12 @@ class PDFToolApp(QMainWindow):
         self.open_selected_inkscape_button = QPushButton("Open SELECTED in Inkscape"); self.open_selected_inkscape_button.clicked.connect(self._open_selected_in_inkscape); self.open_selected_inkscape_button.setEnabled(False)
         self.open_gimp_button = QPushButton("Open SELECTED in GIMP"); self.open_gimp_button.clicked.connect(self._open_selected_in_gimp); self.open_gimp_button.setEnabled(False)
         edit_actions_layout.addWidget(self.open_last_pdf_inkscape_button); edit_actions_layout.addWidget(self.open_selected_inkscape_button); edit_actions_layout.addWidget(self.open_gimp_button)
+        
+        # Add the new button for Image Blender
+        self.open_image_blender_button = QPushButton("Open Image Blender")
+        self.open_image_blender_button.clicked.connect(self._open_image_blender)
+        edit_actions_layout.addWidget(self.open_image_blender_button) # Add to the same layout as other edit actions
+
         edit_actions_group.setLayout(edit_actions_layout); actions_main_layout.addWidget(edit_actions_group)
         actions_group.setLayout(actions_main_layout); main_layout.addWidget(actions_group)
         
@@ -481,6 +494,11 @@ class PDFToolApp(QMainWindow):
             self.last_created_pdf_path = None; self.statusBar().showMessage(f"Error combining: {e}")
             QMessageBox.critical(self, "Combine Error", f"Unexpected error: {e}")
         finally: merger.close(); self._update_button_states()
+
+    def _open_image_blender(self):
+        from image_blender_gui import ImageBlenderWindow
+        blender_dialog = ImageBlenderWindow(self)
+        blender_dialog.exec()
 
     def _open_last_pdf_in_inkscape(self):
         inkscape_path = self.config.get('inkscape_path', '')
