@@ -60,5 +60,7 @@ cover/
 .DS_Store
 Thumbs.db
 # Specific to this project
-lib/
+lib/*
+!lib/PIL/
+!lib/Pillow*.dist-info/
 *.dist-info/
