@@ -16,5 +16,9 @@
     "show_preview": false,
     "libreoffice_draw_path": "C:/Program Files/LibreOffice/program/sdraw.exe",
     "open_combined_in_inkscape": false,
-    "open_combined_in_libreoffice": true
+    "open_combined_in_libreoffice": true,
+    "pdf_to_png_dpi": 450,
+    "delete_after_conversion": false,
+    "delete_after_combination": false,
+    "open_in_libreoffice": true
 }
